@@ -1,0 +1,604 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: |
+  A highly available single node Jenkins architecture: ALB -> ASG (1,1,1) multi-az. 
+  By default, the ALB listens on port 80 (HTTP).
+  However, you can configure the ALB so that it listens on port 443 (HTTPS), by supplying the name of a 
+  Route 53 domain and selecting the appropriate Hosted Zone ID. This creates and attaches an ACM certificate to
+  the ALB, as well as creating an alias record in Route 53 to access the ALB. 
+  Finally, by default, the Jenkins server runs 24/7. 
+  However, you can enable scheduled scaling and enter CRON schedules (UTC) for scaling in and scaling out, at different times.
+
+  Once the stack is created, go to the Outputs tab and click on the URL to access the Jenkins UI.
+  To get the password, go to Systems Manager, and then Session Manager, and start a session on the server (no ssh keys needed). 
+
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - Parameters: 
+          - AccessJenkinsCIDR
+          - VPCCIDR
+          - PublicSubnet1CIDR
+          - PrivateSubnet1CIDR
+          - PublicSubnet2CIDR
+          - PrivateSubnet2CIDR
+          - InstanceType
+          - SecureJenkins
+          - Domain
+          - HostedZoneID
+          - ScheduledScaling
+          - CronScheduleScaleIn
+          - CronScheduleScaleOut
+          - LatestAmi
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type.
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+  LatestAmi:
+    Description: Gets the latest AMI from SSM Parameter store
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    # Amazon Linux 2
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  AccessJenkinsCIDR:
+    Description: The IPv4 address range to access the load balancer from.  
+    Type: String
+    MinLength: 9
+    MaxLength: 18
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: must be a valid IPv4 CIDR range of the form x.x.x.x/x.
+  ScheduledScaling:
+    Description: Scheduled scaling for the ASG.  
+    Type: String
+    Default: 'no'
+    AllowedValues: 
+      - 'yes'
+      - 'no'
+  CronScheduleScaleOut:
+    Description: The UTC cron schedule for scaling out (leave blank if ScheduledScaling is set to no).
+    Type: String
+  CronScheduleScaleIn:
+    Description: The UTC cron schedule for scaling in (leave blank if ScheduledScaling is set to no).
+    Type: String
+  SecureJenkins:
+    Description: Secure Jenkins using SSL/TLS certificate (select yes if you have a domain hosted in Route 53).
+    Type: String
+    Default: 'no'
+    AllowedValues: 
+      - 'yes'
+      - 'no'
+  Domain:
+    Description: The name of a Route 53 domain (leave blank if you don't want to secure Jenkins).
+    Type: String
+  HostedZoneID:
+    Description: The ID of the Route 53 hosted zone (leave blank if you are not securing Jenkins).
+    # Type: AWS::Route53::HostedZone::Id
+    Type: String
+    Default: ''
+  VPCCIDR:
+    Description: The IPv4 address range for the VPC.  
+    Type: String
+    MinLength: 11
+    MaxLength: 18
+    Default: 10.0.0.0/24
+    AllowedPattern: "(\\d{2,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{2})"
+    ConstraintDescription: must be a valid IPv4 CIDR range of the form x.x.x.x/x.
+  PublicSubnet1CIDR:
+    Description: The IPv4 address range for the first public subnet.  
+    Type: String
+    MinLength: 11
+    MaxLength: 18
+    Default: 10.0.0.0/28
+    AllowedPattern: "(\\d{2,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{2})"
+    ConstraintDescription: must be a valid IPv4 CIDR range of the form x.x.x.x/x.
+  PrivateSubnet1CIDR:
+    Description: The IPv4 address range for the first private subnet.  
+    Type: String
+    MinLength: 11
+    MaxLength: 18
+    Default: 10.0.0.16/28
+    AllowedPattern: "(\\d{2,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{2})"
+    ConstraintDescription: must be a valid IPv4 CIDR range of the form x.x.x.x/x.
+  PublicSubnet2CIDR:
+    Description: The IPv4 address range for the second public subnet.  
+    Type: String
+    MinLength: 11
+    MaxLength: 18
+    Default: 10.0.0.32/28
+    AllowedPattern: "(\\d{2,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{2})"
+    ConstraintDescription: must be a valid IPv4 CIDR range of the form x.x.x.x/x.
+  PrivateSubnet2CIDR:
+    Description: The IPv4 address range for the second private subnet.  
+    Type: String
+    MinLength: 11
+    MaxLength: 18
+    Default: 10.0.0.48/28
+    AllowedPattern: "(\\d{2,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{2})"
+    ConstraintDescription: must be a valid IPv4 CIDR range of the form x.x.x.x/x.
+
+Conditions:
+  ScheduledScaling: !Equals [ !Ref ScheduledScaling, 'yes' ]
+  DefaultAccess: !Equals [ !Ref SecureJenkins, 'no' ]
+  SecureAccess: !Equals [ !Ref SecureJenkins, 'yes' ]
+
+Resources:
+  ####################################
+  #                                  #
+  #                                  # 
+  #               VPC                #
+  #                                  #
+  #                                  #
+  ####################################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCIDR
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: Jenkins VPC
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Jenkins VPC IGW
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [ 0, !GetAZs ]
+      Tags:
+        - Key: Name
+          Value: Jenkins Public Subnet 1
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [ 0, !GetAZs ]
+      Tags:
+        - Key: Name
+          Value: Jenkins Private Subnet 1
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [ 1, !GetAZs ]
+      Tags:
+        - Key: Name
+          Value: Jenkins Public Subnet 2
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [ 1, !GetAZs ]
+      Tags:
+        - Key: Name
+          Value: Jenkins Private Subnet 2
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachInternetGateway
+    Properties:
+      Domain: vpc
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachInternetGateway
+    Properties:
+      Domain: vpc
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Jenkins Public Route Table
+  PublicRouteTableEntry:
+    Type: AWS::EC2::Route
+    DependsOn: AttachInternetGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicRouteTableSubnet1Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+  PublicRouteTableSubnet2Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Jenkins Private Route Table 1
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Jenkins Private Route Table 2
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+  ####################################
+  #                                  #
+  #                                  # 
+  #                EC2               #
+  #                                  #
+  #                                  #
+  ####################################
+  JenkinsServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Metadata:
+      Comment: Install Jenkins and mount EFS file system
+      AWS::CloudFormation::Init:
+        configSets: 
+          jenkins: 
+            - mount-file-system
+            - prepare
+            - install
+            - run
+        mount-file-system:
+          commands:
+            command1:
+              command: mkdir /var/lib/jenkins
+            command2:
+              env:
+                FS: !Sub ${FileSystem.FileSystemId}.efs.${AWS::Region}.amazonaws.com
+              command: echo "$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone).$FS:/    /var/lib/jenkins   nfs4    defaults" >> /etc/fstab
+            command3:
+              command: mount -a 
+        prepare:
+          commands:
+            command1:
+              command: yum update -y
+            command2:
+              command: wget -O /etc/yum.repos.d/jenkins.repo https://pkg.jenkins.io/redhat-stable/jenkins.repo
+            command3:
+              command: rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+            command4:
+              command: yum upgrade
+            command5:
+              command: amazon-linux-extras install -y java-openjdk11
+        install:   
+          packages:
+            yum:
+              jenkins: []
+        run:
+          services:
+            sysvinit:
+              jenkins:
+                enabled: true
+                ensureRunning: true
+    Properties:
+      LaunchTemplateName: JenkinsServerLaunchTemplate
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmi
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: 
+          Arn: !GetAtt InstanceProfile.Arn
+        SecurityGroupIds:
+          - !GetAtt JenkinsServerSecurityGroup.GroupId
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: Jenkins Server
+        # Bootstrapping the server
+        UserData:
+          Fn::Base64:
+            !Sub |
+                #!/bin/bash
+
+                # Start cfn-init
+                /opt/aws/bin/cfn-init -v \
+                  --stack ${AWS::StackName} \
+                  --resource JenkinsServerLaunchTemplate \
+                  --configsets jenkins \
+                  --region ${AWS::Region}
+
+                # Signal the status of cfn-init to ASG
+                /opt/aws/bin/cfn-signal -e $? \
+                  --stack ${AWS::StackName} \
+                  --resource JenkinsServerAutoScalingGroup \
+                  --region ${AWS::Region}      
+  JenkinsServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: jenkins-role
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+      Policies:
+        - PolicyName: FullPermission
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement: 
+              - Effect: Allow
+                Action: '*'
+                Resource: '*'
+  InstanceProfile: 
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Path: "/"
+      Roles: 
+        - !Ref JenkinsServerRole
+  JenkinsServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: JenkinsServer
+      GroupDescription: Security group for Jenkins
+      VpcId: !Ref VPC
+  JenkinsServerSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      GroupId: !GetAtt JenkinsServerSecurityGroup.GroupId
+      SourceSecurityGroupId: !GetAtt LoadBalancerSecurityGroup.GroupId
+  ####################################
+  #                                  #
+  #                                  # 
+  #               ACM                #
+  #                                  #
+  #                                  #
+  ####################################
+  ACMCertificate: 
+    Type: AWS::CertificateManager::Certificate
+    Condition: SecureAccess
+    Properties: 
+      DomainName: !Sub jenkins.${Domain}
+      DomainValidationOptions:
+       - DomainName: !Sub jenkins.${Domain}
+         HostedZoneId: !Ref HostedZoneID
+      ValidationMethod: DNS
+  ####################################
+  #                                  #
+  #                                  # 
+  #           Load Balancer          #
+  #                                  #
+  #                                  #
+  ####################################
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: JenkinsServerALB
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !GetAtt LoadBalancerSecurityGroup.GroupId
+  LoadBalancerListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: DefaultAccess
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref JenkinsServerTargetGroup
+  LoadBalancerListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: SecureAccess
+    DependsOn: ACMCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Certificates:
+        - CertificateArn: !Ref ACMCertificate
+      Port: 443
+      Protocol: HTTPS
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref JenkinsServerTargetGroup
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: JenkinsServerLoadBalancer
+      GroupDescription: Security group for the Jenkins server load balancer
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          DestinationSecurityGroupId: !GetAtt JenkinsServerSecurityGroup.GroupId
+  LoadBalancerSecurityGroupIngressHTTP:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: DefaultAccess
+    Properties:
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      GroupId: !GetAtt LoadBalancerSecurityGroup.GroupId
+      CidrIp: !Ref AccessJenkinsCIDR
+  LoadBalancerSecurityGroupIngressHTTPS:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: SecureAccess
+    Properties:
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      GroupId: !GetAtt LoadBalancerSecurityGroup.GroupId
+      CidrIp: !Ref AccessJenkinsCIDR
+  JenkinsServerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: /login
+      Name: JenkinsServerTargetGroup
+      Port: 8080
+      Protocol: HTTP
+      TargetType: instance
+      VpcId: !Ref VPC
+  ####################################
+  #                                  # 
+  #                                  #  
+  #                ASG               #
+  #                                  #
+  #                                  #
+  ####################################
+  JenkinsServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    Properties:
+      AutoScalingGroupName: JenkinsServer
+      LaunchTemplate:
+        LaunchTemplateId: !Ref JenkinsServerLaunchTemplate
+        Version: !GetAtt JenkinsServerLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 1
+      DesiredCapacity: 1
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      TargetGroupARNs:
+        - !Ref JenkinsServerTargetGroup
+  ScheduledActionScaleIn: 
+    Type: AWS::AutoScaling::ScheduledAction
+    Condition: ScheduledScaling
+    Properties:
+      AutoScalingGroupName: !Ref JenkinsServerAutoScalingGroup
+      MinSize: 0
+      MaxSize: 0
+      DesiredCapacity: 0
+      Recurrence: !Ref CronScheduleScaleIn
+  ScheduledActionScaleOut: 
+    Type: AWS::AutoScaling::ScheduledAction
+    Condition: ScheduledScaling
+    Properties:
+      AutoScalingGroupName: !Ref JenkinsServerAutoScalingGroup
+      MinSize: 1
+      MaxSize: 1
+      DesiredCapacity: 1
+      Recurrence: !Ref CronScheduleScaleOut
+  ####################################
+  #                                  #
+  #                                  # 
+  #               EFS                #
+  #                                  #
+  #                                  #
+  ####################################
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupName: JenkinsServerEFS
+      GroupDescription: Enable EFS access via port 2049
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !GetAtt JenkinsServerSecurityGroup.GroupId
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: Jenkins
+  MountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroups:
+        - !GetAtt EFSSecurityGroup.GroupId
+  MountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref PrivateSubnet2
+      SecurityGroups:
+        - !GetAtt EFSSecurityGroup.GroupId
+  ####################################
+  #                                  #
+  #                                  # 
+  #              Route 53            #
+  #                                  #
+  #                                  #
+  ####################################
+  DNSRecordAlias:
+    Type: AWS::Route53::RecordSet
+    Condition: SecureAccess
+    DependsOn: JenkinsServerAutoScalingGroup
+    Properties:
+      HostedZoneName: !Sub ${Domain}.
+      Name: !Sub jenkins.${Domain}
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        EvaluateTargetHealth: true
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+      Type: A
+  
+Outputs:
+  HTTP:
+    Value: !Sub http://${LoadBalancer.DNSName}
+    Condition: DefaultAccess
+  HTTPS:
+    Value: !Sub https://jenkins.${Domain}
+    Condition: SecureAccess
+  
