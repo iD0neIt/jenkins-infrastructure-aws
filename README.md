@@ -1,10 +1,10 @@
 # Jenkins on AWS
 
 ## Background
-Jenkins is a popular, open source, Java-based CI/CD tool that integrates with the major cloud providers (AWS, Azure, GCP and DigitalOcean) and has a rich set of plugins.
+Jenkins is a popular, open source, Java-based CI/CD tool, that integrates with the major cloud providers (AWS, Azure, GCP and DigitalOcean), and has a rich set of plugins.
 However, in my opinion, when it comes to Jenkins, there is a learning curve. You really need to have a good play with Jenkins in order to get
 comfortable with it (at least this was my experience).  
-Therefore, in this repo, you will find an AWS CloudFormation template I created, that deploys an highly available Jenkins server (one node).  
+Therefore, in this repo, you will find an AWS CloudFormation template I created, that deploys a highly available Jenkins server (one node).  
 Please feel free to use this CloudFormation template if you want to practice working with Jenkins.  
 
 ***WARNING: deploying the template will incur costs.***
