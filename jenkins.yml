@@ -4,7 +4,7 @@ Description: |
   A highly available single node Jenkins architecture: ALB -> ASG (1,1,1) multi-az. 
   By default, the ALB listens on port 80 (HTTP).
   However, you can configure the ALB so that it listens on port 443 (HTTPS), by supplying the name of a 
-  Route 53 domain and selecting the appropriate Hosted Zone ID. This creates and attaches an ACM certificate to
+  Route 53 domain and entering the appropriate Hosted Zone ID. This creates and attaches an ACM certificate to
   the ALB, as well as creating an alias record in Route 53 to access the ALB. 
   Finally, by default, the Jenkins server runs 24/7. 
   However, you can enable scheduled scaling and enter CRON schedules (UTC) for scaling in and scaling out, at different times.
@@ -71,20 +71,18 @@ Parameters:
     Description: The UTC cron schedule for scaling in (leave blank if ScheduledScaling is set to no).
     Type: String
   SecureJenkins:
-    Description: Secure Jenkins using SSL/TLS certificate (select yes if you have a domain hosted in Route 53).
+    Description: Secure Jenkins using SSL/TLS certificate (select 'yes' if you have a domain hosted in Route 53).
     Type: String
     Default: 'no'
     AllowedValues: 
       - 'yes'
       - 'no'
   Domain:
-    Description: The name of a Route 53 domain (leave blank if you don't want to secure Jenkins).
+    Description: The name of a Route 53 domain (leave blank if you are not securing Jenkins).
     Type: String
   HostedZoneID:
     Description: The ID of the Route 53 hosted zone (leave blank if you are not securing Jenkins).
-    # Type: AWS::Route53::HostedZone::Id
     Type: String
-    Default: ''
   VPCCIDR:
     Description: The IPv4 address range for the VPC.  
     Type: String
@@ -444,7 +442,6 @@ Resources:
   LoadBalancerListenerHTTPS:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Condition: SecureAccess
-    DependsOn: ACMCertificate
     Properties:
       LoadBalancerArn: !Ref LoadBalancer
       Certificates:
